@@ -4,7 +4,7 @@ import threading
 import subprocess
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int64, String, Bool, Int8, Int32
+from std_msgs.msg import Int64, String, Bool, Int8, Int32, Float32
 import time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 import os
@@ -23,6 +23,7 @@ class TopicMonitorNode(Node):
         self.status_subscribers = {}
         self.update_callback = update_callback
         self.trigger_callback = trigger_callback
+        self.gui = None # Reference to GUI for updates
 
         qos_profile = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
 
@@ -52,6 +53,21 @@ class TopicMonitorNode(Node):
         self.motor_publisher = self.create_publisher(Int32, "/INDEPTH/MotorDrive", 10)
         self.supply_pump_publisher = self.create_publisher(Int32, "/INDEPTH/SupplyPump", 10)
         self.suction_pump_publisher = self.create_publisher(Int32, "/INDEPTH/SuctionPump", 10)
+
+        # --- NEW: Monitoring Subscribers ---
+        self.raw_pos_sub = self.create_subscription(Int32, "/INDEPTH/RawPosition", self.raw_pos_callback, 10)
+        self.rev_count_sub = self.create_subscription(Float32, "/INDEPTH/RevCount", self.rev_count_callback, 10)
+
+    def set_gui(self, gui):
+        self.gui = gui
+
+    def raw_pos_callback(self, msg):
+        if self.gui:
+            self.gui.update_raw_pos(msg.data)
+
+    def rev_count_callback(self, msg):
+        if self.gui:
+            self.gui.update_rev_count(msg.data)
 
     # Function to publish motor speed
     def publish_motor_speed(self, speed_value):
@@ -100,6 +116,9 @@ class MonitorGUI:
         # --- NEW: Pump State Tracking ---
         self.is_supply_on = False
         self.is_suction_on = False
+        
+        # --- NEW: Rev Limit Variable ---
+        self.limit_triggered = False
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -268,6 +287,52 @@ class MonitorGUI:
             command=self.toggle_suction_pump
         )
         self.btn_suction_toggle.pack(pady=5)
+        
+        # --- NEW SECTION: MOTOR MONITORING ---
+        tk.Frame(frame_motor, height=2, bd=1, relief=tk.SUNKEN).pack(fill=tk.X, padx=10, pady=10)
+        
+        frame_monitor = tk.Frame(frame_motor)
+        frame_monitor.pack(fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(frame_monitor, text="Motor Feedback", font=("Arial", 10, "bold")).pack()
+        
+        frame_monitor_data = tk.Frame(frame_monitor)
+        frame_monitor_data.pack(pady=5)
+        
+        # Raw Position Label
+        self.lbl_raw_pos = tk.Label(frame_monitor_data, text="Raw Pos: --", font=("Courier", 12, "bold"), fg="cyan", bg="black", width=15)
+        self.lbl_raw_pos.pack(side=tk.LEFT, padx=10)
+        
+        self.lbl_rev_count = tk.Label(frame_monitor_data, text="Rev: --", font=("Courier", 12, "bold"), fg="lime", bg="black", width=15)
+        self.lbl_rev_count.pack(side=tk.LEFT, padx=10)
+        
+        # --- NEW SECTION: REV LIMIT CONTROL (UPPER & LOWER) ---
+        frame_limit = tk.Frame(frame_monitor)
+        frame_limit.pack(pady=5)
+        
+        # Upper Limit (Max)
+        frame_upper = tk.Frame(frame_limit)
+        frame_upper.pack(anchor=tk.W)
+        self.use_upper_limit_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame_upper, text="Enable Max", variable=self.use_upper_limit_var).pack(side=tk.LEFT)
+        tk.Label(frame_upper, text="Limit:").pack(side=tk.LEFT, padx=(5, 2))
+        self.upper_limit_var = tk.StringVar(value="5000")
+        self.ent_upper_limit = tk.Entry(frame_upper, textvariable=self.upper_limit_var, width=8, justify='center')
+        self.ent_upper_limit.pack(side=tk.LEFT)
+
+        # Lower Limit (Min)
+        frame_lower = tk.Frame(frame_limit)
+        frame_lower.pack(anchor=tk.W)
+        self.use_lower_limit_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame_lower, text="Enable Min", variable=self.use_lower_limit_var).pack(side=tk.LEFT)
+        tk.Label(frame_lower, text="Limit:").pack(side=tk.LEFT, padx=(5, 2))
+        self.lower_limit_var = tk.StringVar(value="0")
+        self.ent_lower_limit = tk.Entry(frame_lower, textvariable=self.lower_limit_var, width=8, justify='center')
+        self.ent_lower_limit.pack(side=tk.LEFT)
+        
+        # Reset Limit State Button
+        self.btn_reset_limit = tk.Button(frame_limit, text="Reset Limit State", command=self.reset_limit_state, font=("Arial", 8))
+        self.btn_reset_limit.pack(pady=5)
         # ---------------------------------
 
         frame_agent = tk.Frame(self.root)
@@ -392,6 +457,56 @@ class MonitorGUI:
             self.ros2_node.publish_suction_pump(pwm)
             self.terminal_output.insert(tk.END, f"\n[GUI] Updated Suction Pump: {pwm}%", ("white",))
             self.terminal_output.see(tk.END)
+    
+    # --- NEW: Monitoring Updates ---
+    def update_raw_pos(self, value):
+        # Update in main thread
+        self.root.after(0, lambda: self.lbl_raw_pos.config(text=f"Raw Pos: {value}"))
+
+    def update_rev_count(self, value):
+        # Update UI
+        self.root.after(0, lambda: self.lbl_rev_count.config(text=f"Rev: {value:.2f}"))
+        
+        # Check Limit Logic
+        if not self.limit_triggered:
+            # Check Upper Limit
+            if self.use_upper_limit_var.get():
+                try:
+                    limit = float(self.upper_limit_var.get())
+                    if value >= limit:
+                        # Check if moving vertically (positive speed usually means increasing revs, depends on motor)
+                        # Actually simpler: just stop if out of bounds and moving.
+                        if self.motor_speed_slider.get() != 0:
+                            self.stop_motor_due_to_limit(limit, "Max")
+                except ValueError:
+                    pass
+
+            # Check Lower Limit
+            if not self.limit_triggered and self.use_lower_limit_var.get():
+                try:
+                    limit = float(self.lower_limit_var.get())
+                    if value <= limit:
+                        if self.motor_speed_slider.get() != 0:
+                            self.stop_motor_due_to_limit(limit, "Min")
+                except ValueError:
+                    pass
+
+    def stop_motor_due_to_limit(self, limit, limit_type):
+        if self.ros2_node:
+            self.limit_triggered = True
+            self.ros2_node.publish_motor_speed(0)
+            self.root.after(0, lambda: self.handle_limit_stop_gui(limit, limit_type))
+
+    def handle_limit_stop_gui(self, limit, limit_type):
+        self.motor_speed_slider.set(0)
+        self.terminal_output.insert(tk.END, f"\n[Limit] Motor stopped! {limit_type} limit {limit} reached.", ("red",))
+        self.terminal_output.see(tk.END)
+        messagebox.showwarning("Limit Reached", f"Motor stopped because {limit_type} revolution limit ({limit}) was reached.")
+    
+    def reset_limit_state(self):
+        self.limit_triggered = False
+        self.terminal_output.insert(tk.END, f"\n[Limit] State reset. Motor can move again.", ("green",))
+        self.terminal_output.see(tk.END)
     # ------------------
 
     # --- NEW: Enable/Disable Entry based on Checkbox ---
@@ -518,6 +633,7 @@ def main():
     rclpy.init()
     node = TopicMonitorNode(timestamp_topics, status_topics, None, None)
     gui = MonitorGUI(timestamp_topics, status_topics)
+    node.set_gui(gui) # Link GUI to Node
 
     def ros2_thread():
         rclpy.spin(node)

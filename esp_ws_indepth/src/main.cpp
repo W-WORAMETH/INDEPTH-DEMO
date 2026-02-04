@@ -23,6 +23,17 @@ std_msgs__msg__Int32 MotorCMDmsg;
 std_msgs__msg__Int32 SuctionMsg;
 std_msgs__msg__Int32 SupplyMsg;
 
+// --- NEW: Monitoring Variables ---
+rcl_publisher_t publisher_raw_position;
+rcl_publisher_t publisher_rev_count;
+
+std_msgs__msg__Int32 msg_raw_position;
+std_msgs__msg__Float32 msg_rev_count;
+
+int32_t monitor_last_position = 0;
+float monitor_total_revolutions = 0.0;
+const float TICKS_PER_REV = 4096.0;
+
 Adafruit_NeoPixel WS2812B(NUM_PIXELS, PIN_WS2812B, NEO_GRB + NEO_KHZ800);
 
 // --- NEW: Callback for Suction Pump ---
@@ -55,6 +66,39 @@ void subscription_callback_supply(const void *msgin)
   int pwm_output = map(pwm_input, 0, 100, 0, 255);
   
   analogWrite(PIN_SUPPLY, pwm_output);
+}
+
+void timer_callback_monitoring(rcl_timer_t *timer, int64_t last_call_time)
+{
+  (void) last_call_time;
+  if (timer != NULL)
+  {
+    // Read current position of Motor 1 (Index 0 in DXL_VELOCITY_ID_LIST)
+    int32_t current_pos = dxl.getPresentPosition(DXL_VELOCITY_ID_LIST[0]);
+
+    // Calculate delta
+    int32_t delta = current_pos - monitor_last_position;
+
+    // Handle wrap-around (0 to 4095)
+    // If delta is large negative (e.g. -4000), it means it crossed from 4095 to 0 (Forward)
+    if (delta < -2048) {
+      delta += 4096;
+    } 
+    // If delta is large positive (e.g. +4000), it means it crossed from 0 to 4095 (Backward)
+    else if (delta > 2048) {
+      delta -= 4096;
+    }
+
+    monitor_total_revolutions += (float)delta / TICKS_PER_REV;
+    monitor_last_position = current_pos;
+
+    // Publish
+    msg_raw_position.data = current_pos;
+    msg_rev_count.data = monitor_total_revolutions;
+
+    rcl_publish(&publisher_raw_position, &msg_raw_position, NULL);
+    rcl_publish(&publisher_rev_count, &msg_rev_count, NULL);
+  }
 }
 
 void subscription_callback_motorcmd(const void *msgin)
@@ -125,10 +169,33 @@ bool create_entities()
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
       "INDEPTH/SupplyPump"));
 
+  // --- NEW: Monitoring Publishers ---
+  RCCHECK(rclc_publisher_init_default(
+    &publisher_raw_position,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+    "INDEPTH/RawPosition"));
+
+  RCCHECK(rclc_publisher_init_default(
+    &publisher_rev_count,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+    "INDEPTH/RevCount"));
+
+  // --- NEW: Timer Init (20Hz = 50ms) ---
+  RCCHECK(rclc_timer_init_default(
+    &timer,
+    &support,
+    RCL_MS_TO_NS(50),
+    timer_callback_monitoring));
+
   executor = rclc_executor_get_zero_initialized_executor();
   
-  // --- UPDATED: Executor size increased to 3 (Motor + Suction + Supply) ---
-  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
+  // --- UPDATED: Executor size increased. Motor + Suction + Supply + Timer = 4.
+  // Wait, previously it was 3. Now adding timer. Total handles = 3 subs + 1 timer = 4.
+  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
+
+  RCCHECK(rclc_executor_add_timer(&executor, &timer));
 
   RCCHECK(rclc_executor_add_subscription(&executor, &MotorCMDsubscriber, &MotorCMDmsg, &subscription_callback_motorcmd, ON_NEW_DATA));
   
@@ -148,6 +215,10 @@ void destroy_entities()
   // --- NEW: Finish Pump Subscribers ---
   rcl_subscription_fini(&SuctionSubscriber, &node);
   rcl_subscription_fini(&SupplySubscriber, &node);
+  
+  // --- NEW: Finish Publishers ---
+  rcl_publisher_fini(&publisher_raw_position, &node);
+  rcl_publisher_fini(&publisher_rev_count, &node);
 
   rcl_timer_fini(&timer);
   rclc_executor_fini(&executor);
@@ -198,6 +269,10 @@ void setup()
   fillSyncReadStructures();
   fillSyncWriteStructures();
 
+  // --- NEW: Initialize Monitor Variables ---
+  monitor_last_position = dxl.getPresentPosition(DXL_VELOCITY_ID_LIST[0]);
+  monitor_total_revolutions = 0.0;
+
   if(create_entities())
   {
       WS2812B.begin();
@@ -209,6 +284,8 @@ void setup()
       WS2812B.begin();
       WS2812B.setPixelColor(0, WS2812B.Color(100, 0, 0));
       WS2812B.show();
+      delay(500);
+      ESP.restart();
   }
 }
 
