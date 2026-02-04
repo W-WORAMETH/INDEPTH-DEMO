@@ -4,7 +4,7 @@ import threading
 import subprocess
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int64, String, Bool, Int8, Int32, Float32
+from std_msgs.msg import Int32, Float32
 import time
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 import os
@@ -17,37 +17,13 @@ script_dir = os.path.dirname(__file__)  # Directory of the script
 image_path = os.path.join(script_dir, "image/logo.png")
 
 class TopicMonitorNode(Node):
-    def __init__(self, timestamp_topics, status_topics, update_callback, trigger_callback):
+    def __init__(self, update_callback, trigger_callback):
         super().__init__('topic_monitor_node')
-        self.timestamp_subscribers = {}
-        self.status_subscribers = {}
         self.update_callback = update_callback
         self.trigger_callback = trigger_callback
         self.gui = None # Reference to GUI for updates
 
         qos_profile = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-
-        # Subscribe to TimeStamp topics
-        for topic in timestamp_topics:
-            self.timestamp_subscribers[topic] = self.create_subscription(
-                Int64,
-                topic,
-                lambda msg, t=topic: self.timestamp_callback(t, msg),
-                qos_profile
-            )
-
-        # Subscribe to Status topics
-        for topic in status_topics:
-            self.status_subscribers[topic] = self.create_subscription(
-                String,
-                topic,
-                lambda msg, t=topic: self.status_callback(t, msg),
-                10
-            )
-
-        # Publisher for trigger commands
-        self.trigger_publisher = self.create_publisher(Int8, "/Visens/TriggerCommand", 10)
-        self.trigger_format_publisher = self.create_publisher(Bool, "/Visens/TriggerFormat", 10)
 
         # --- Motor & Pump Publishers ---
         self.motor_publisher = self.create_publisher(Int32, "/INDEPTH/MotorDrive", 10)
@@ -89,20 +65,10 @@ class TopicMonitorNode(Node):
         self.suction_pump_publisher.publish(msg)
         print(f"Published Suction Pump PWM: {pwm_value}")
 
-    def publish_trigger(self, value):
-        msg = Int8()
-        msg.data = value
-        self.trigger_publisher.publish(msg)
-
-        if self.trigger_callback:
-            self.trigger_callback(value)
-
 class MonitorGUI:
-    def __init__(self, timestamp_topics, status_topics):
-        self.timestamp_topics = timestamp_topics
-        self.status_topics = status_topics
+    def __init__(self):
         self.root = tk.Tk()
-        self.root.title("VISENS Sensor Monitoring")
+        self.root.title("INDEPTH Monitoring")
 
         # Fix window size and make it unchangeable
         self.root.geometry("1000x1100")
@@ -306,6 +272,14 @@ class MonitorGUI:
         self.lbl_rev_count = tk.Label(frame_monitor_data, text="Rev: --", font=("Courier", 12, "bold"), fg="lime", bg="black", width=15)
         self.lbl_rev_count.pack(side=tk.LEFT, padx=10)
         
+        # --- NEW: LED Indicator ---
+        frame_led = tk.Frame(frame_monitor_data, bg="black")
+        frame_led.pack(side=tk.LEFT, padx=10)
+        self.led_canvas = tk.Canvas(frame_led, width=20, height=20, bg="black", highlightthickness=0)
+        self.led_canvas.pack(side=tk.LEFT)
+        self.led_circle = self.led_canvas.create_oval(2, 2, 18, 18, fill="green", outline="white")
+        tk.Label(frame_led, text="Status", fg="white", bg="black", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        
         # --- NEW SECTION: REV LIMIT CONTROL (UPPER & LOWER) ---
         frame_limit = tk.Frame(frame_monitor)
         frame_limit.pack(pady=5)
@@ -315,8 +289,8 @@ class MonitorGUI:
         frame_upper.pack(anchor=tk.W)
         self.use_upper_limit_var = tk.BooleanVar(value=True)
         tk.Checkbutton(frame_upper, text="Enable Max", variable=self.use_upper_limit_var).pack(side=tk.LEFT)
-        tk.Label(frame_upper, text="Limit:").pack(side=tk.LEFT, padx=(5, 2))
-        self.upper_limit_var = tk.StringVar(value="5000")
+        tk.Label(frame_upper, text="Limit(rev):").pack(side=tk.LEFT, padx=(5, 2))
+        self.upper_limit_var = tk.StringVar(value="1")
         self.ent_upper_limit = tk.Entry(frame_upper, textvariable=self.upper_limit_var, width=8, justify='center')
         self.ent_upper_limit.pack(side=tk.LEFT)
 
@@ -325,8 +299,8 @@ class MonitorGUI:
         frame_lower.pack(anchor=tk.W)
         self.use_lower_limit_var = tk.BooleanVar(value=True)
         tk.Checkbutton(frame_lower, text="Enable Min", variable=self.use_lower_limit_var).pack(side=tk.LEFT)
-        tk.Label(frame_lower, text="Limit:").pack(side=tk.LEFT, padx=(5, 2))
-        self.lower_limit_var = tk.StringVar(value="0")
+        tk.Label(frame_lower, text="Limit(rev):").pack(side=tk.LEFT, padx=(5, 2))
+        self.lower_limit_var = tk.StringVar(value="-500")
         self.ent_lower_limit = tk.Entry(frame_lower, textvariable=self.lower_limit_var, width=8, justify='center')
         self.ent_lower_limit.pack(side=tk.LEFT)
         
@@ -501,10 +475,14 @@ class MonitorGUI:
         self.motor_speed_slider.set(0)
         self.terminal_output.insert(tk.END, f"\n[Limit] Motor stopped! {limit_type} limit {limit} reached.", ("red",))
         self.terminal_output.see(tk.END)
+        # Change LED to Red
+        self.led_canvas.itemconfig(self.led_circle, fill="red")
         messagebox.showwarning("Limit Reached", f"Motor stopped because {limit_type} revolution limit ({limit}) was reached.")
     
     def reset_limit_state(self):
         self.limit_triggered = False
+        # Change LED to Green
+        self.led_canvas.itemconfig(self.led_circle, fill="green")
         self.terminal_output.insert(tk.END, f"\n[Limit] State reset. Motor can move again.", ("green",))
         self.terminal_output.see(tk.END)
     # ------------------
@@ -627,12 +605,9 @@ class MonitorGUI:
         self.root.destroy()
 
 def main():
-    timestamp_topics = [f"Visens/Current1/TimeStamp"] + [f"Visens/Vibration{i}/TimeStamp" for i in range(1, 11)]
-    status_topics = [f"Visens/Current1/Status"] + [f"Visens/Vibration{i}/Status" for i in range(1, 11)]
-
     rclpy.init()
-    node = TopicMonitorNode(timestamp_topics, status_topics, None, None)
-    gui = MonitorGUI(timestamp_topics, status_topics)
+    node = TopicMonitorNode(None, None)
+    gui = MonitorGUI()
     node.set_gui(gui) # Link GUI to Node
 
     def ros2_thread():
